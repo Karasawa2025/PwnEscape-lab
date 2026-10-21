@@ -1,0 +1,74 @@
+// r7_obs4.bt -- evidence-strengthened chain observer (dayburn additions; chain unchanged).
+//
+// Daybreak findings addressed:
+//  W1: workqueue_queue_work fires BEFORE insert_work -> NOT a commit record.
+//      -> QUEUE is kept only for pairing; the commit records are ACT (activate_work =
+//         the active-list insert) and EXEC/EXECEND.
+//  W2: workqueue_execute_start rereads LIVE work->func, but dispatch calls the earlier
+//      worker->current_func snapshot (kernel/workqueue.c:2566 snapshot, :2633 call,
+//      :2638 trace). -> EXEC prints the live reread; EXECEND prints the snapshot that
+//      was ACTUALLY called (trace arg 'function' = worker->current_func).
+//  W3: __ip_options_echo probe is external; name alone not trusted.
+//      -> ECHO (kprobe entry) prints args; ECHORET (kretprobe RETURN) prints retval and
+//         the DESTINATION state after the call: dst->optlen (the summed copy length:
+//         64 for dry set 0x40, 224 for fire set 0xE0) and the first 8 bytes written to
+//         dst->__data (= obj+32, the copy landing at O). This is the write-to-O commit.
+//  W4: callback entry kprobe on call_usermodehelper_exec_work (fire). arg0 =
+//      subprocess_info.work (offset 0, RANDSTRUCT_NONE) == X'. __x86_return_thunk
+//      kprobe intentionally NOT added: it fires on every kernel return (unbounded rate),
+//      would flood and perturb the us-scale chain; the dry's called-func proof is
+//      EXECEND's snapshot == __x86_return_thunk.
+//  Work identity (never ftrace entry->return cache pairing): WCHK = rt6_probe-gated
+//  kmalloc_trace(size=56), cache from arg0 PER EVENT, kmrel from the entry stack
+//  return address; cross-checked against QUEUE work address.
+//
+// struct ip_options (6.8, include/net/inet_sock.h): faddr+0 nexthop+4 optlen+8(1B)
+// srr+9 rr+10 ts+11 flags+12 ... __data+16. ip_options_rcu: rcu(16)+opt -> arg1 = obj+16.
+kprobe:__ip_options_echo {
+  $skb = (struct sk_buff *)arg2;
+  $sopt = (struct ip_options *)arg3;
+  $th = (uint16 *)((uint64)$skb->head + $skb->transport_header);
+  @edopt[tid] = arg1;
+  @esport[tid] = bswap(*$th);
+  printf("ECHO dopt=%lx soptlen=%u rr=%u sport=%u cpu=%d\n",
+         arg1 - 16, $sopt->optlen, $sopt->rr, bswap(*$th), cpu);
+}
+kretprobe:__ip_options_echo /@edopt[tid] != 0/ {
+  $d = @edopt[tid];
+  printf("ECHORET sport=%u ret=%d dstoptlen=%u dstrr=%u data0=%lx\n",
+         @esport[tid], (int32)retval, *(uint8 *)($d + 8), *(uint8 *)($d + 10),
+         *(uint64 *)($d + 16));
+  delete(@edopt[tid]); delete(@esport[tid]);
+}
+kprobe:rt6_probe { @rt[tid] = *(uint64 *)reg("sp"); }
+kretprobe:rt6_probe { delete(@rt[tid]); }
+kprobe:kmalloc_trace /@rt[tid] != 0 && arg2 == 56/ {
+  @cache[tid] = arg0; @site[tid] = *(uint64 *)reg("sp"); @hit[tid] = 1;
+}
+kretprobe:kmalloc_trace /@hit[tid] == 1/ {
+  printf("WCHK work=%lx cache=%lx kmrel=%lx cpu=%d name=%s\n",
+         retval, @cache[tid], @site[tid] - kaddr("rt6_probe"), cpu,
+         str(((struct kmem_cache *)@cache[tid])->name));
+  @seen[retval] = 1;
+  delete(@hit[tid]); delete(@cache[tid]); delete(@site[tid]);
+}
+tracepoint:workqueue:workqueue_queue_work {
+  if (args->function == kaddr("rt6_probe_deferred")) {
+    printf("QUEUE work=%lx funclive=%lx cpu=%d\n", args->work, args->function, args->cpu);
+    @seen[(uint64)args->work] = 1;
+  }
+}
+tracepoint:workqueue:workqueue_activate_work /@seen[(uint64)args->work] != 0/ {
+  printf("ACT work=%lx cpu=%d\n", args->work, cpu);
+}
+tracepoint:workqueue:workqueue_execute_start /@seen[(uint64)args->work] != 0/ {
+  $w = (uint64)args->work;
+  printf("EXEC work=%lx funclive=%lx cpu=%d\n", $w, *(uint64 *)($w + 24), cpu);
+}
+tracepoint:workqueue:workqueue_execute_end /@seen[(uint64)args->work] != 0/ {
+  printf("EXECEND work=%lx funccalled=%lx cpu=%d\n", args->work, args->function, cpu);
+  delete(@seen[(uint64)args->work]);
+}
+kprobe:call_usermodehelper_exec_work {
+  printf("CB work=%lx cpu=%d\n", arg0, cpu);
+}

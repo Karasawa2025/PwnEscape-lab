@@ -1,0 +1,11 @@
+// r7 gate observer: ECHO dopt + live rt6 work cache name and internal kmalloc site.
+kprobe:__ip_options_echo { printf("ECHO %lx %u\n", arg1-16, bswap(*(uint16 *)((uint64)((struct sk_buff *)arg2)->head + ((struct sk_buff *)arg2)->transport_header))); }
+kprobe:rt6_probe { @rt[tid] = *(uint64 *)reg("sp"); }
+kretprobe:rt6_probe { delete(@rt[tid]); }
+kprobe:kmalloc_trace /@rt[tid] != 0 && arg2 == 56/ { @c[tid] = arg0; @km[tid] = *(uint64 *)reg("sp"); @h[tid] = 1; }
+kretprobe:kmalloc_trace /@h[tid] == 1/ {
+  printf("WCHK work=%lx cache=%lx kmrel=%lx idx=%d cpu=%d name=%s\n",
+         retval, @c[tid], @km[tid]-kaddr("rt6_probe"), cpu, cpu,
+         str(((struct kmem_cache *)@c[tid])->name));
+  delete(@h[tid]); delete(@c[tid]); delete(@km[tid]);
+}
